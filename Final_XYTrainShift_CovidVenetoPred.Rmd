@@ -1,0 +1,407 @@
+---
+title: "XYTrainShift_CovidVenetoPred"
+author: "Imola Fodor"
+date: "1/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Come diceva Auguste Compte: “Vedere per prevedere, prevedere per provvedere”. 
+
+Data Preparation
+
+```{r}
+data_all = read.csv("https://raw.githubusercontent.com/pcm-dpc/COVID-19/master/dati-regioni/dpc-covid19-ita-regioni.csv")
+
+#data_all <- read_excel("D:\\DSSC\\1semester-Courses\\SMDS\\final project\\train.data.xlsx")
+
+data_all$date_only <- as.Date(data_all$data)
+data_all$date_unix <- as.numeric(data_all$date_only)
+data_subset = subset(data_all,denominazione_regione == "Veneto" & date_only >= "2020-09-01" & date_only < "2021-01-27")
+
+data_subset$nlag <- 14
+
+#Shift rows "back in time" to predict on known data
+
+data_subset$lag_ti <- sapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$terapia_intensiva[indx]
+     else
+        data_subset$terapia_intensiva[1]
+})
+
+data_subset$lag_deceduti<- sapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$deceduti[indx]
+     else
+        data_subset$deceduti[1]
+})
+
+data_subset$lag_nuovi_positivi <- sapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$nuovi_positivi[indx]
+     else
+        data_subset$nuovi_positivi[1]
+})
+
+
+#14:07 30.01 GOOD FOR GAM, BUT ADDING RIC CON SIM
+data_subset$variazione_guariti_dimessi <- lapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$dimessi_guariti[indx] - data_subset$dimessi_guariti[indx-1]
+     else
+        NULL
+})
+
+data_subset$variazione_tamponi <- lapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$tamponi[indx] - data_subset$tamponi[indx-1]
+     else
+        NULL
+})
+
+
+library(dplyr)
+
+data_subset$lag_ric_con_sintomi <- sapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$ricoverati_con_sintomi[indx]
+     else
+        data_subset$ricoverati_con_sintomi[1]
+})
+
+data_subset <- data_subset %>% mutate(zona = case_when(
+    (date_only < "2020-12-19"  & date_only > "2020-09-01") | (date_only < "2021-01-09" & date_only>"2021-01-06") |  date_only <= "2020-09-01"  ~ 1 ,
+    (date_only < "2020-12-23"  & date_only > "2020-12-18") | (date_only < "2020-12-31"  & date_only > "2020-12-27") | date_only == "2021-01-04" | date_only > "2021-01-06" | (date_only < "2021-01-11" & date_only>"2021-01-08") ~ 2  ,
+    (date_only < "2020-12-28"  & date_only > "2020-12-22") | (date_only < "2021-01-04"  & date_only > "2020-12-30") | (date_only >"2021-01-04" | date_only <"2021-01-07") ~ 3))
+
+data_subset <- data_subset %>% mutate(stagione = case_when(
+    date_only < "2020-09-22"  ~ 0 ,
+    date_only >= "2020-09-22" ~ 1))
+
+data_subset$nlagextra <- 7
+
+data_subset$perc_esaurito_ti <- sapply(seq_along(data_subset$terapia_intensiva), function(x) {
+        indx = x - data_subset$nlagextra[x]
+        if(indx > 0)
+          data_subset$terapia_intensiva[indx]*100/1016
+        else
+          0
+})
+
+
+data_subset$lag_zona <- sapply(seq_along(data_subset$nlagextra), function(x) {
+      indx = x - data_subset$nlagextra[x]
+     if(indx > 0)
+        data_subset$zona[indx]
+     else
+        1
+})
+
+data_subset$lag_stagione <- sapply(seq_along(data_subset$nlagextra), function(x) {
+      indx = x - data_subset$nlagextra[x]
+     if(indx > 0)
+        data_subset$stagione[indx]
+     else
+        1
+})
+
+
+#ADDITIONAL ONES FOR EXTRA
+
+data_subset$variazione_tot_osp <- lapply(seq_along(data_subset$nlag), function(x) {
+      indx = x - data_subset$nlag[x]
+     if(indx > 0)
+        data_subset$totale_ospedalizzati[indx] - data_subset$totale_ospedalizzati[indx-1]
+     else
+        NULL
+})
+
+#Moving average function that includes the current observation
+mav <- function(x,n){stats::filter(x,rep(1/n,n), sides=1)}
+
+#Moving average function that does not include the current observation
+mavback <- function(x,n){
+  a<-mav(x,1)
+  b<-mav(x,(n+1))
+  c<-(1/n)*((n+1)*b - a)
+  return(c)
+}
+
+#Backward looking moving average function, not including current obs, based on [h2] readings starting [h1] periods back
+mavback1<-function(x,h1,h2){
+  a<-mavback(x,h1)
+  b<-mavback(x,h1-h2)
+  c<-(1/h2)*(h1*a -(h1-h2)*b)
+  return(c)
+}
+
+data_subset$ma_tot_osp <- mavback1(data_subset$totale_ospedalizzati,17,3)
+data_subset$ma_decessi <- mavback1(data_subset$deceduti,17,3)
+
+data = subset(data_subset,denominazione_regione == "Veneto" & date_only >= "2020-09-18" & date_only <= "2021-01-10")
+```
+
+Data Exploration
+
+ - What is shifting after all?
+ 
+```{r}
+myvars <- c("date_only", "terapia_intensiva", "deceduti", "lag_deceduti")
+check_train_data <- data[myvars]
+check_train_data
+```
+
+ - is there an autocorrelation? Checking with acf, autocorrelation function. Autocorrelation proved for even 14 days. 
+ 
+```{r}
+acf(data_subset$terapia_intensiva, lag.max=14, plot=TRUE)
+```
+
+
+
+Data Processing/Engineering
+
+
+
+Correlations between Features
+
+
+
+Modeling
+
+ - Poisson
+
+```{r}
+
+
+poisson_r.model <- glm(terapia_intensiva ~ date_unix  + poly(lag_nuovi_positivi,2) + as.numeric(type.convert(variazione_tamponi)) + poly(lag_deceduti,3) + zona + lag_zona + lag_stagione, data = data, family = poisson(link = "log") )
+
+
+#mine
+poisson_extra.model <- glm(terapia_intensiva ~ date_unix  + ma_decessi + ma_tot_osp + as.numeric(type.convert(variazione_tot_osp)) +  perc_esaurito_ti, data = data, family = poisson(link = "log") ) # quite good, but not scaled variables
+summary(poisson_r.model)
+```
+
+ - Quasi Poisson
+ 
+```{r}
+#team
+
+quasipoisson_r.model <- glm(terapia_intensiva ~ date_unix  + poly(lag_nuovi_positivi,2) + as.numeric(type.convert(variazione_tamponi)) + poly(lag_deceduti,3) + zona + lag_zona + lag_stagione, data = data, family = quasipoisson(link = "log") )
+```
+
+ - Negative Binomial
+ 
+```{r}
+library(MASS)
+negbin_r.model <- glm.nb(terapia_intensiva ~ date_unix  + poly(lag_nuovi_positivi,2) + as.numeric(type.convert(variazione_tamponi)) + poly(lag_deceduti,3) + zona + lag_zona + lag_stagione, data = data)
+```
+
+
+ - GAM
+ 
+```{r}
+library(mgcv)
+gam_penu.model <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) + lag_ric_con_sintomi + s(lag_deceduti) + zona + lag_zona + lag_stagione, data=data)
+
+
+gam_r.model <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) + s(as.numeric(type.convert(variazione_tamponi))) + s(lag_deceduti) + zona + lag_zona + lag_stagione, data=data)
+
+gam_extra.model <- gam(terapia_intensiva ~ date_unix  + s(ma_decessi) + s(ma_tot_osp) + (as.numeric(type.convert(variazione_tot_osp))) + perc_esaurito_ti, data=data)
+
+summary(gam_penu.model)
+```
+
+ - Random Forest
+ 
+```{r}
+library(randomForest)
+#rf_r.model <- randomForest(terapia_intensiva ~ date_unix  + lag_nuovi_positivi + as.numeric(type.convert(variazione_tamponi)) + lag_deceduti + zona + lag_zona + lag_stagione, data=data, importance=TRUE) #CHANGE VARIAZIONE
+```
+
+
+Model Comparison
+
+ - AIC 
+
+```{r}
+#in general, the comparison
+AIC(poisson_extra.model,gam_extra.model, quasipoisson_r.model, negbin_r.model,gam_penu.model, gam_r.model)
+```
+
+ - LR Test
+
+```{r}
+library("lmtest")
+lrtest(poisson_r.model, negbin_r.model)
+```
+
+
+Prediction
+
+```{r}
+
+# make a dataframe with new data
+newdata = subset(data_subset,denominazione_regione == "Veneto" & date_only > "2021-01-10" & date_only < "2021-01-24")
+myvars <- c("date_only", "terapia_intensiva", "lag_deceduti")
+check_test_data <- newdata[myvars]
+check_test_data
+
+# use 'predict()' to run model on new data
+pred_r_pois = predict(poisson_r.model, newdata = newdata, type = "response")
+pred_extra_pois = predict(poisson_extra.model, newdata = newdata, type = "response")
+pred_pois_quasi = predict(quasipoisson_r.model, newdata = newdata, type = "response")
+pred_bin = predict(negbin_r.model, newdata, type = "response")
+pred_gam_penu = predict(gam_penu.model, newdata, type = "response")
+
+#pred_gam_extra = predict(gam_extra.model, newdata, type = "response") 
+#pred.rf1 <- predict(rf_r.model, newdata, type = "response")
+```
+
+
+
+
+Compare Model Predictions
+
+```{r}
+
+#  geom_line(data = newdata, aes(x = date_only, y = pred_pois, color = "pois"), size=1 ) +
+#  geom_line(data = newdata, aes(x = date_only, y = pred_pois_quasi, color = "quasi pois"), size=1 ) +
+#  geom_line(data = newdata, aes(x = date_only, y = pred_bin, color = "neg binomial"), size=1) +
+#"pois" = "lightblue", "quasi pois" = "orange", "neg binomial"="pink",
+library(ggplot2)  
+ggplot() + 
+ 
+  geom_line(data = newdata, aes(x = date_only, y = pred_gam_penu, color = "gam PENU"), size=1) + 
+  geom_line(data = newdata, aes(x = date_only, y = pred_r_pois, color = "pois REGULAR"), size=1 ) +
+  geom_line(data = newdata, aes(x = date_only, y = pred_extra_pois, color = "pois CUSTOM EXTRA"), size=1 ) +
+  geom_line(data = newdata, aes(x = date_only, y = pred_pois_quasi, color = "quasi pois REGULAR"), size=1 ) +
+  geom_line(data = newdata, aes(x = date_only, y = pred_bin, color = "neg binomial REGULAR"), size=1) +
+  geom_line(data = newdata, aes(x = date_only, y = terapia_intensiva, color = "empirical"),size=1) +
+  #geom_line(data=newdata, aes(x=date_only, y=pred.rf1, color= "RF REGULAR"), size=1)+  "RF REGULAR" = "blue",
+  scale_color_manual(name = "Fit", 
+                     values = c("pois REGULAR" = "lightblue", "gam PENU"="brown", "quasi pois REGULAR" = "orange", "neg binomial REGULAR"="pink","pois CUSTOM EXTRA" = "red",  "empirical"="darkgreen")) +
+  xlab('dates') +
+  ylab('count in intensive care')
+
+```
+
+
+ Predictive information criteria on model comparison
+
+Generating models that proved worthy comparing
+
+```{r}
+gam.model1 <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) +  s(lag_deceduti) + as.numeric(type.convert(variazione_guariti_dimessi)), family = poisson, data=data)
+
+gam.model2 <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) +  s(lag_deceduti) + lag_ric_con_sintomi  + zona + lag_zona, family = poisson, data=data)
+
+rf.model1 <- randomForest(terapia_intensiva ~ date_unix + lag_nuovi_positivi + lag_ric_con_sintomi+
+                   lag_deceduti+zona+lag_zona, data=data, importance=TRUE)
+
+gam.model3 <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) +  s(lag_deceduti) + lag_ric_con_sintomi  + zona + lag_zona + lag_stagione, family = poisson, data=data)
+
+
+gam.model4 <- gam(terapia_intensiva ~ date_unix  + s(lag_nuovi_positivi) +  s(lag_deceduti) + lag_ric_con_sintomi  + zona + lag_zona + perc_esaurito_ti, family = poisson, data=data)
+
+
+#CUSTOM FOR EXTRA
+poisson.model <- glm(terapia_intensiva ~ date_unix  + ma_decessi + ma_tot_osp + as.numeric(type.convert(variazione_tot_osp)) + perc_esaurito_ti, data = data, family = poisson(link = "log") ) # quite good, but not scaled variables
+
+
+```
+
+
+ - MSE
+ 
+```{r}
+#Mean Squre Error
+MSE.glm <- mean((newdata$terapia_intensiva-pred_extra_pois)^2)
+MSE.gam <- mean((newdata$terapia_intensiva-pred_gam_penu)^2)
+MSE.gam_extra <- mean((newdata$terapia_intensiva-pred_gam_extra)^2)
+#RMSE
+RMSE.glm <- sqrt(MSE.glm)
+RMSE.gam <- sqrt(MSE.gam)
+#NRMSE
+NRMSE.glm <- (RMSE.glm)/mean(newdata$terapia_intensiva)
+NRMSE.gam <- (RMSE.gam)/mean(newdata$terapia_intensiva)
+
+models <- c("glm.poisson EXTRA","GAM Penultimate R", "GAM Extra")
+MSE <- c(MSE.glm,MSE.gam, MSE.gam_extra)
+RMSE <- c(RMSE.glm,RMSE.gam)
+NRMSE <- c(NRMSE.glm,NRMSE.gam)
+
+data.frame(models,MSE, RMSE,NRMSE)
+```
+
+ 
+ - Confidence Intervals
+
+```{r}
+
+predict.confidence <- function(object, newdata, level = 0.95, ...) {
+    if (!is(object, "glm")) {
+        stop("Model should be a glm")
+    }
+    if (!is(newdata, "data.frame")) {
+        stop("Plase input a data frame for newdata")
+    }
+    if (!is.numeric(level) | level < 0 | level > 1) {
+        stop("level should be numeric and between 0 and 1")
+    }
+    ilink <- family(object)$linkinv
+    ci.factor <- qnorm(1 - (1 - level)/2)
+    # calculate CIs:
+    fit <- predict(object, newdata = newdata, level = level, 
+                    type = "link", se.fit = TRUE, ...)
+    lwr <- ilink(fit$fit - ci.factor * fit$se.fit)
+    upr <- ilink(fit$fit + ci.factor * fit$se.fit)
+    df <- data.frame("fit" = ilink(fit$fit), "lwr" = lwr, "upr" = upr)
+    return(df)
+}
+
+conf.df <- predict.confidence(gam.model3, newdata)
+head(conf.df, 2)
+
+plot.confidence <- function(df, feature) {
+    library(ggplot2)
+    p <- ggplot(df, aes_string(x = feature, 
+                       y = "fit")) + 
+      geom_line(colour = "blue") + 
+      geom_point() + 
+      geom_ribbon(aes(ymin = lwr, ymax = upr), 
+                    alpha = 0.5) 
+      return(p)
+}
+
+plot.confidence.features <- function(data, features) {
+    plots <- list()
+    for (feature in features) {
+        p <- plot.confidence(data, feature)
+        plots[[feature]] <- p
+    }
+    library(gridExtra)
+    #grid.arrange(plots[[1]], plots[[2]], plots[[3]])
+    do.call(grid.arrange, plots)
+}
+
+
+data <- cbind(newdata, conf.df)
+data_train_test = subset(data_subset,denominazione_regione == "Veneto" & date_only > "2020-09-15" & date_only <= "2021-01-23")
+plot.confidence.features(data,c("lag_nuovi_positivi","lag_deceduti","lag_ric_con_sintomi","zona","lag_zona","lag_stagione"))
+```
+
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
