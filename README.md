@@ -1,3 +1,3 @@
-## Covid cases prediction
+## Predictiong The number of Covid cases in Veneto region in Italy
 
-The project of Statistical Methods for Data Science course done in a group.
+Statistical Methods for Data Science project done in a group.
